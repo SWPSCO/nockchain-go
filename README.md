@@ -7,8 +7,7 @@ wallet derivation. The Go package name is `nockchain`.
 go get github.com/yapishu/nockchain-go
 ```
 
-For this private repository, configure Git authentication and include
-`github.com/yapishu/nockchain-go` in `GOPRIVATE`. Go 1.23 or newer is required.
+Go 1.23 or newer is required.
 
 ## Scope
 
