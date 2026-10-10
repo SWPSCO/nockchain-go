@@ -8,6 +8,7 @@ import (
 	"crypto/sha512"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"math/big"
 	"strconv"
 	"strings"
@@ -50,6 +51,11 @@ func (k ExtendedKey) String() string {
 
 // GoString keeps formatted diagnostic output free of key material.
 func (k ExtendedKey) GoString() string { return k.String() }
+
+// Format redacts key material for diagnostic verbs, including numeric formats.
+func (k ExtendedKey) Format(state fmt.State, _ rune) {
+	_, _ = state.Write([]byte(k.String()))
+}
 
 func hmac512(key, data []byte) []byte {
 	h := hmac.New(sha512.New, key)

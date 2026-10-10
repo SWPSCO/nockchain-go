@@ -51,7 +51,7 @@ func TestValidationBoundaries(t *testing.T) {
 	if _, err = LockRoot(Digest{Prime}); err == nil {
 		t.Fatal("noncanonical digest accepted")
 	}
-	for _, format := range []string{"%v", "%+v", "%#v", "%s"} {
+	for _, format := range []string{"%v", "%+v", "%#v", "%s", "%d", "%x", "%q"} {
 		if got := fmt.Sprintf(format, k); got != "Nockchain key (private)" {
 			t.Fatalf("unexpected diagnostic %s", got)
 		}
