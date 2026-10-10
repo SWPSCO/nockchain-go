@@ -8,10 +8,10 @@ import sys
 import tempfile
 
 if len(sys.argv) != 3:
-    raise SystemExit('usage: generate.py TX_TYPES_ROOT SIGER_ESP_ROOT')
+    raise SystemExit('usage: generate.py TX_TYPES_ROOT NOCKSTER_ROOT')
 tx = pathlib.Path(sys.argv[1]).resolve()
-siger = pathlib.Path(sys.argv[2]).resolve()
-core = siger / 'nockster-esp/crates/nockster-core'
+nockster = pathlib.Path(sys.argv[2]).resolve()
+core = nockster / 'crates/nockster-core'
 q = lambda path: json.dumps(str(path))
 manifest = f'''[package]
 name = "nockchain-go-reference"

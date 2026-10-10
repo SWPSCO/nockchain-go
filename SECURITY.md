@@ -8,12 +8,12 @@ That parser rejects private extended keys, invalid checksums, unsupported
 versions, noncanonical coordinates, points outside the curve's prime-order
 subgroup, and inconsistent master metadata. Parsing is length-bounded.
 
-Private key generation and derivation use variable-time arithmetic, including
+Private key generation, derivation, and signing use variable-time arithmetic, including
 `math/big` and scalar-dependent branches. They are for offline wallet tools and
 tests. They are not constant-time primitives and must not be exposed as a
-remote signing or key-derivation service. This package does not sign transactions.
+remote signing or key-derivation service.
 
-`Zprv` deliberately exports secrets. Treat its result, seed input, and every
+`Zprv`, `RecoveryPhrase.Words`, and `Seed.Bytes` deliberately export secrets. Treat its result, seed input, and every
 copy of a private key as spending authority. String formatting redacts key
 material, but callers remain responsible for storage, logging, backups, and
 access control. Go's allocator and garbage collector do not provide a guarantee
@@ -27,6 +27,12 @@ Address allocation, recovery paths, payment attribution, canonical-chain checks,
 confirmation policy, and transaction replay protection belong to the integrating
 application. A syntactically valid address or lock root does not establish
 ownership of a payment or its finality.
+
+Transaction construction supports plain V1 single-signature PKH locks. It checks
+declared balances, recipient amounts, and fees. The caller verifies input note
+existence, ownership, spendability, and finality against trusted chain state. It
+does not validate arbitrary transactions or implement multisig, timelocks,
+bridge deposits, transaction submission, or full consensus validation.
 
 The test corpus establishes interoperability with pinned reference
 implementations. It is not a substitute for an independent cryptographic audit.
