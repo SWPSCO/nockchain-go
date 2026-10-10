@@ -1,4 +1,4 @@
-module github.com/yapishu/nockchain-go
+module github.com/SWPSCO/nockchain-go
 
 go 1.23.2
 

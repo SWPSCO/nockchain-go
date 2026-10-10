@@ -4,14 +4,19 @@ Nockchain V1 wallet and transaction tools in Go. Derive receiving addresses,
 review transactions, prepare payments, and sign single-key or multisig spends.
 Use the same package natively or through its WebAssembly adapter.
 
-[![Go checks](https://github.com/yapishu/nockchain-go/actions/workflows/ci.yml/badge.svg)](https://github.com/yapishu/nockchain-go/actions/workflows/ci.yml)
-[![Go Reference](https://pkg.go.dev/badge/github.com/yapishu/nockchain-go.svg)](https://pkg.go.dev/github.com/yapishu/nockchain-go)
+[![Go checks](https://github.com/SWPSCO/nockchain-go/actions/workflows/ci.yml/badge.svg)](https://github.com/SWPSCO/nockchain-go/actions/workflows/ci.yml)
+
+The official upstream is [SWPSCO/nockchain-go](https://github.com/SWPSCO/nockchain-go).
+Published versions and WebAssembly bundles are available in
+[Releases](https://github.com/SWPSCO/nockchain-go/releases).
 
 ```sh
-go get github.com/yapishu/nockchain-go@v0.1.0
+go get github.com/SWPSCO/nockchain-go@v0.1.1
 ```
 
-Requires **Go 1.23+**. Import as `nockchain "github.com/yapishu/nockchain-go"`.
+Requires **Go 1.23+**. Import as `nockchain "github.com/SWPSCO/nockchain-go"`.
+Private repository access requires authenticated Git and
+`GOPRIVATE=github.com/SWPSCO/nockchain-go`.
 
 ## Capabilities
 
@@ -234,5 +239,21 @@ NOCKCHAIN_TEST_KEY=/private/path/test.key go test -run TestLocalWalletExport
 Regenerating the consensus fixture requires Nockchain’s `hoon` executable.
 Normal tests use checked-in fixtures and need no Hoon/Rust toolchain or network.
 **Never send funds to public test-vector addresses.**
+
+## Releases
+
+Maintainers publish from `main` with an annotated semantic-version tag:
+
+```sh
+git tag -a vX.Y.Z -m 'nockchain-go vX.Y.Z'
+git push origin vX.Y.Z
+```
+
+The release workflow runs the complete CI matrix before publishing. It verifies
+that the tag belongs to `main`, builds and tests the WebAssembly adapter, and
+attaches `nockchain-go-vX.Y.Z-wasm.tar.gz` and `SHA256SUMS` to the GitHub release.
+The archive includes the matching Go runtime, JavaScript wrapper, type
+declarations, browser example, and dependency licenses. Go consumers install
+the tagged module directly; this library has no native command-line executable.
 
 MIT licensed. See [LICENSE](LICENSE).

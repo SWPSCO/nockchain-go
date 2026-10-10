@@ -6,7 +6,7 @@ package main
 import (
 	"syscall/js"
 
-	"github.com/yapishu/nockchain-go/internal/wasmapi"
+	"github.com/SWPSCO/nockchain-go/internal/wasmapi"
 )
 
 func main() {

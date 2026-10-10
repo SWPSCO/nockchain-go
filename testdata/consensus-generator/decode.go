@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"os"
 
-	nockchain "github.com/yapishu/nockchain-go"
+	nockchain "github.com/SWPSCO/nockchain-go"
 )
 
 type fixture struct {

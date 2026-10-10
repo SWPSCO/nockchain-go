@@ -9,7 +9,7 @@ import (
 	"io"
 	"strconv"
 
-	nockchain "github.com/yapishu/nockchain-go"
+	nockchain "github.com/SWPSCO/nockchain-go"
 )
 
 type heightRange struct{ Min, Max *string }

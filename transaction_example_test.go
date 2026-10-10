@@ -2,7 +2,7 @@ package nockchain_test
 
 import (
 	"fmt"
-	nockchain "github.com/yapishu/nockchain-go"
+	nockchain "github.com/SWPSCO/nockchain-go"
 )
 
 func ExamplePrepareTransactionV1() {
