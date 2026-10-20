@@ -3,7 +3,6 @@ package nockchain
 import (
 	"bytes"
 	"errors"
-	"math/bits"
 )
 
 // ReceiveAddress identifies a non-hardened child of a public receiving branch.
@@ -48,6 +47,7 @@ type Payment struct{ Address, Amount string }
 // TransferOptions controls explicit change and fees. Empty ChangeAddress sends
 // change to the sender. FeeNicks=0 selects the minimum fee for the resulting plan.
 type TransferOptions struct {
+	Chain         *ChainContext
 	ChangeAddress string
 	FeeNicks      uint64
 }
@@ -62,9 +62,10 @@ type TransferSummary struct {
 
 // PreparedTransfer is an immutable, unsigned payment plan ready for review.
 type PreparedTransfer struct {
-	plans   []SpendPlanV1
-	summary TransferSummary
-	public  []byte
+	transaction TransactionV1
+	notes       []NoteV1
+	summary     TransferSummary
+	public      []byte
 }
 
 // Summary returns a detached copy. Altering it cannot change the plan being signed.
@@ -78,10 +79,14 @@ func (p PreparedTransfer) Summary() TransferSummary {
 // Private-key arithmetic is variable-time; signing belongs in offline tooling.
 func (p PreparedTransfer) Sign(key ExtendedKey) (TransferV1, error) {
 	pub, e := key.PublicBytes()
-	if e != nil || len(p.plans) == 0 || !bytes.Equal(pub, p.public) {
+	if e != nil || len(p.notes) == 0 || !bytes.Equal(pub, p.public) {
 		return TransferV1{}, errors.New("signing key does not match prepared transfer")
 	}
-	return key.SignTransferV1(p.plans)
+	tx, e := p.transaction.Sign(key)
+	if e != nil {
+		return TransferV1{}, e
+	}
+	return TransferV1{tx.raw, tx.id, true}, nil
 }
 
 // PrepareTransfer consumes all supplied notes, pays the requested recipients,
@@ -90,148 +95,88 @@ func (p PreparedTransfer) Sign(key ExtendedKey) (TransferV1, error) {
 // exact key and verify chain state before calling this function. SelectTransfer
 // selects a sufficient subset when consuming every note is unnecessary.
 func PrepareTransfer(sender ExtendedKey, notes []UnspentNote, payments []Payment, options TransferOptions) (PreparedTransfer, error) {
-	if len(notes) < 1 || len(notes) > MaxTransferInputs || len(payments) < 1 || len(payments) > MaxTransferOutputs {
+	return prepareTransfer(sender, notes, payments, options, true)
+}
+func prepareTransfer(sender ExtendedKey, notes []UnspentNote, payments []Payment, options TransferOptions, manual bool) (PreparedTransfer, error) {
+	if len(notes) == 0 || len(payments) == 0 || len(payments) > MaxTransferOutputs {
 		return PreparedTransfer{}, errors.New("transfer size out of range")
 	}
 	public, e := sender.PublicBytes()
 	if e != nil {
 		return PreparedTransfer{}, e
 	}
-	address, _ := sender.Address()
+	address, e := sender.Address()
+	if e != nil {
+		return PreparedTransfer{}, e
+	}
 	pkh, _ := ParseDigest(address)
-	lock, _ := LockRoot(pkh)
 	change := options.ChangeAddress
 	if change == "" {
 		change = address
 	}
 	changePKH, e := ParseDigest(change)
 	if e != nil {
-		return PreparedTransfer{}, errors.New("invalid change address")
+		return PreparedTransfer{}, e
 	}
-	summary := TransferSummary{InputCount: len(notes), ChangeAddress: change}
-	names := map[NoteName]bool{}
-	for _, n := range notes {
-		if _, e := n.Note.Hash(); e != nil {
-			return PreparedTransfer{}, e
-		}
-		bound, _ := NoteFirstV1(lock)
-		if names[n.Note.Name] || n.Note.Name.First != bound || n.LockRoot != lock || n.Note.Nicks == 0 || n.Note.Nicks >= Prime {
-			return PreparedTransfer{}, errors.New("duplicate, invalid, or unauthorized input")
-		}
-		names[n.Note.Name] = true
-		sum, c := bits.Add64(summary.InputNicks, n.Note.Nicks, 0)
-		if c != 0 {
-			return PreparedTransfer{}, errors.New("input total overflow")
-		}
-		summary.InputNicks = sum
-	}
-	recipients := []Digest{}
-	amounts := []uint64{}
-	positions := map[Digest]int{}
-	for _, p := range payments {
-		recipient, e := ParseDigest(p.Address)
-		if e != nil {
-			return PreparedTransfer{}, errors.New("invalid payment address")
-		}
-		n, e := ParseNocks(p.Amount)
-		if e != nil || n == 0 || n >= Prime {
-			return PreparedTransfer{}, errors.New("invalid or inexact NOCK payment amount")
-		}
-		total, c := bits.Add64(summary.PaymentNicks, n, 0)
-		if c != 0 {
-			return PreparedTransfer{}, errors.New("payment total overflow")
-		}
-		summary.PaymentNicks = total
-		if index, ok := positions[recipient]; ok {
-			sum, c := bits.Add64(amounts[index], n, 0)
-			if c != 0 {
-				return PreparedTransfer{}, errors.New("recipient amount overflow")
-			}
-			amounts[index] = sum
-		} else {
-			positions[recipient] = len(recipients)
-			recipients = append(recipients, recipient)
-			amounts = append(amounts, n)
-		}
-		summary.Payments = append(summary.Payments, Payment{p.Address, FormatNocks(n)})
-	}
-	if summary.PaymentNicks >= summary.InputNicks {
-		return PreparedTransfer{}, errors.New("insufficient funds for payment and fees")
-	}
-	available := summary.InputNicks - summary.PaymentNicks
-	minimum, _ := MinimumTransferFeeV1(len(notes), recipients)
-	fee := options.FeeNicks
-	if fee == 0 {
-		fee = minimum
-		if available > fee {
-			withChange := append([]Digest(nil), recipients...)
-			if _, exists := positions[changePKH]; !exists {
-				withChange = append(withChange, changePKH)
-			}
-			fee, e = MinimumTransferFeeV1(len(notes), withChange)
-			if e == nil && fee > available && available >= minimum {
-				fee = available
-			}
-			if e != nil {
-				return PreparedTransfer{}, e
-			}
-		}
-	}
-	if fee > available {
-		return PreparedTransfer{}, errors.New("insufficient funds for payment and fees")
-	}
-	changeNicks := available - fee
-	if changeNicks > 0 {
-		if index, ok := positions[changePKH]; ok {
-			amounts[index] += changeNicks
-		} else {
-			recipients = append(recipients, changePKH)
-			amounts = append(amounts, changeNicks)
-		}
-	}
-	minimum, e = MinimumTransferFeeV1(len(notes), recipients)
+	refund, e := PlannedPayment(changePKH, 0, false)
 	if e != nil {
 		return PreparedTransfer{}, e
 	}
-	if fee < minimum {
+	request := PlanRequest{Refund: refund, Chain: options.Chain}
+	if manual {
+		request.Selection = make([]NoteName, 0, len(notes))
+	}
+	if options.FeeNicks != 0 {
+		fee := options.FeeNicks
+		request.FeeNicks = &fee
+	}
+	for _, unspent := range notes {
+		bound, e := NoteFirstV1(unspent.LockRoot)
+		if e != nil || bound != unspent.Note.Name.First {
+			return PreparedTransfer{}, errors.New("input name does not bind supplied lock root")
+		}
+		request.Candidates = append(request.Candidates, unspent.Note)
+		if manual {
+			request.Selection = append(request.Selection, unspent.Note.Name)
+		}
+	}
+	summary := TransferSummary{ChangeAddress: change}
+	for _, payment := range payments {
+		recipient, e := ParseDigest(payment.Address)
+		if e != nil {
+			return PreparedTransfer{}, e
+		}
+		amount, e := ParseNocks(payment.Amount)
+		if e != nil || amount == 0 || amount >= Prime {
+			return PreparedTransfer{}, errors.New("invalid payment amount")
+		}
+		output, e := PlannedPayment(recipient, amount, false)
+		if e != nil {
+			return PreparedTransfer{}, e
+		}
+		request.Outputs = append(request.Outputs, output)
+		summary.PaymentNicks, e = addAmount(summary.PaymentNicks, amount)
+		if e != nil {
+			return PreparedTransfer{}, e
+		}
+		summary.Payments = append(summary.Payments, Payment{payment.Address, FormatNocks(amount)})
+	}
+	result, e := Plan(request, NewSigningKeyLockMatcher(pkh))
+	if e != nil {
+		return PreparedTransfer{}, e
+	}
+	if result.FinalFee < result.MinimumFee {
 		return PreparedTransfer{}, errors.New("fee below minimum")
 	}
-	summary.FeeNicks, summary.ChangeNicks = fee, changeNicks
-	plans := make([]SpendPlanV1, 0, len(notes))
-	remainingFee := fee
-	output := 0
-	outputCount := 0
-	for _, note := range notes {
-		inputFee := remainingFee
-		if inputFee >= note.Note.Nicks {
-			inputFee = note.Note.Nicks - 1
-		}
-		remainingFee -= inputFee
-		plan := SpendPlanV1{Note: note.Note, LockRoot: note.LockRoot, Fee: inputFee}
-		remaining := note.Note.Nicks - inputFee
-		for remaining > 0 {
-			if output >= len(amounts) {
-				return PreparedTransfer{}, errors.New("input values cannot be allocated to the requested outputs")
-			}
-			value := amounts[output]
-			if value > remaining {
-				value = remaining
-			}
-			plan.Outputs = append(plan.Outputs, PaymentV1{recipients[output], value})
-			outputCount++
-			if outputCount > MaxTransferOutputs {
-				return PreparedTransfer{}, errors.New("output count out of range")
-			}
-			remaining -= value
-			amounts[output] -= value
-			if amounts[output] == 0 {
-				output++
-			}
-		}
-		plans = append(plans, plan)
+	summary.InputCount = len(result.Selected)
+	summary.InputNicks = result.SelectedTotal
+	summary.FeeNicks = result.FinalFee
+	for _, refund := range result.Refunds {
+		summary.ChangeNicks += refund.Amount
 	}
-	if remainingFee != 0 {
-		return PreparedTransfer{}, errors.New("notes cannot cover the requested fee")
+	selectedV1 := make([]NoteV1, len(result.Selected))
+	for i, note := range result.Selected {
+		selectedV1[i] = note.(NoteV1)
 	}
-	return PreparedTransfer{plans, summary, public}, nil
+	return PreparedTransfer{transaction: result.Transaction, notes: selectedV1, summary: summary, public: public}, nil
 }

@@ -2,8 +2,9 @@
 
 Build the Go package into an executable `js/wasm` module with a typed JavaScript
 wrapper. The adapter covers public derivation, exact amounts, lock construction,
-fee estimation, transaction preparation, inspection, partial signing, signature
-merging, and input validation.
+fee estimation, pure planning, transaction preparation, inspection, partial
+signing, signature merging, and input validation. Lock trees, hashlocks, typed
+metadata encoded as JAM, fund policies, and V0 migration use the native Go core.
 
 ## Build and run
 
@@ -81,6 +82,7 @@ only the documented fields. See [nockchain.d.mts](nockchain.d.mts) for complete 
 | `formatNocks` | `nicks` | Exact NOCK string |
 | `lock` | `inputLocks: [lock]` | Root, first note-name component, policy |
 | `minimumFee` | `inputLocks`, `outputLocks` | Minimum nicks string |
+| `plan` | `notes`, `height`, `planning`, optional `fees` and `fundPolicy` | Reviewed transaction, selected records, refunds and fee words |
 | `prepareTransaction` | `plans` | Unsigned jam and review |
 | `inspect` | `jam` | ID, spends, outputs, fees and signer review |
 | `verifySignatures` | `jam` | `true`, or an error |
@@ -88,11 +90,44 @@ only the documented fields. See [nockchain.d.mts](nockchain.d.mts) for complete 
 | `mergeSignatures` | `jam`, `otherJam` | Combined jam and review |
 | `validateInputs` | `jam`, `notes`, `height` | `true`, or an error |
 
-A lock is `{ threshold: 2, keys: [alicePKH, bobPKH, carolPKH], timelock: null }`.
-Optional timelocks have `relative` and `absolute` ranges, each with `min` and `max`
-strings or null. A complete input note supplies `originPage`, `first`, `last`,
-`noteDataJam`, and `nicks`. Even empty metadata is explicit: its jam is `"02"`.
-Never omit stored metadata when calculating input commitments.
+A PKH condition is `{ threshold: 2, keys: [alicePKH, bobPKH, carolPKH] }`.
+Optional `timelock` ranges contain `min` and `max` strings or null; `hashes` adds
+required preimages. `{ hashes: [...] }` constructs a hashlock, `{ burn: true }`
+a burn condition, and `{ conditions: [...] }` a lock tree. `{ jam: lockJam }`
+accepts any supported lock form, including general conjunctive conditions.
+Choose exactly one representation. Reviews include `lockJam`, hash requirements,
+all timelocks, and burn status.
+
+A complete V1 input note supplies `originPage`, `first`, `last`, `noteDataJam`,
+and `nicks`. `{ jam: completeNoteJam }` accepts a complete V0 or V1 record.
+Even empty metadata is explicit: its JAM is `"02"`. Outputs choose `lock` or
+`lockRoot`, with optional `noteDataJam`; opaque roots default to empty metadata.
+Never omit stored input metadata when calculating parent commitments.
+
+```js
+const result = nockchain.call('plan', {
+  notes: verifiedNotes,
+  height: '170000',
+  planning: {
+    signerPKH,
+    outputs: [{ lock: recipientLock, nicks: '1000000' }],
+    refund: { lock: senderLock, nicks: '0' },
+  },
+});
+// Review result.transaction.summary, selected, refunds, finalFee, and minimumFee.
+```
+
+Planning supports `selection`, `order`, `feeNicks`, and `sweep`. Choose either
+`signerPKH` or a `lockRoot` matcher with optional `lock`, `leafNumber`, and JAM
+`preimages`. `fundPolicy` supplies the authoritative fund root, first name, and
+maturity parameters. `height` controls admission and defaults the fee height;
+`fees` overrides the fee context independently. Without a height, timed and fund
+notes are ineligible. Selected records include their complete JAM for validation.
+
+Set `planning.version: 0` to migrate V0 records into V1 outputs. For inspection,
+signing, merging, and verification of migration transactions, pass the complete
+V0 records in `notes`. For `validateInputs`, pass exactly the selected records.
+Pass the same `fees` and `fundPolicy` context through the transaction workflow.
 
 ```js
 const unsigned = nockchain.call('prepareTransaction', {

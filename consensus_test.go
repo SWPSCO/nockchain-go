@@ -47,7 +47,7 @@ func TestCanonicalHoonOracle(t *testing.T) {
 	oracle := consensusVectors(t)
 	type input struct {
 		jam, id string
-		notes   []NoteV1
+		notes   []InputNote
 	}
 	var cases []input
 	for _, v := range transactionVectors(t) {
@@ -58,7 +58,7 @@ func TestCanonicalHoonOracle(t *testing.T) {
 		cases = append(cases, c)
 	}
 	for _, v := range multisigVectors(t) {
-		cases = append(cases, input{v.Jam, v.ID, []NoteV1{v.Note}})
+		cases = append(cases, input{v.Jam, v.ID, []InputNote{v.Note}})
 	}
 	for _, c := range cases {
 		t.Run(c.id, func(t *testing.T) {

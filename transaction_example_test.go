@@ -23,7 +23,7 @@ func ExamplePrepareTransactionV1() {
 		Name:       nockchain.NoteName{First: first, Last: nockchain.Digest{1, 2, 3, 4, 5}},
 		Nicks:      10_000_000,
 	}
-	fee, _ := nockchain.MinimumTransactionFeeV1([]nockchain.LockV1{lock}, []nockchain.LockV1{lock})
+	fee, _ := nockchain.MinimumTransactionFeeV1([]nockchain.LockFormV1{lock}, []nockchain.LockFormV1{lock})
 	plan, err := nockchain.PrepareTransactionV1([]nockchain.LockedSpendPlanV1{{
 		Note: note, Lock: lock, Fee: fee,
 		Outputs: []nockchain.LockedPaymentV1{{Lock: lock, Nicks: note.Nicks - fee}},
@@ -39,7 +39,7 @@ func ExamplePrepareTransactionV1() {
 		panic(err)
 	}
 	fmt.Println(complete.VerifySignatures() == nil)
-	fmt.Println(complete.ValidateInputs([]nockchain.NoteV1{note}, 105) == nil)
+	fmt.Println(complete.ValidateInputs([]nockchain.InputNote{note}, 105) == nil)
 	// Output:
 	// true
 	// true
