@@ -7,7 +7,7 @@ import (
 )
 
 func TestJSONBoundary(t *testing.T) {
-	for _, request := range []string{`{}`, `{"method":"formatNocks","nicks":1}`, `{"method":"formatNocks","nicks":"01"}`, `{"method":"formatNocks","nicks":"-1"}`, `{"method":"parseNocks","amount":"1","unknown":true}`, `{"method":"parseNocks","amount":"1"} {}`, strings.Repeat(" ", 4<<20+1)} {
+	for _, request := range []string{`{"method":"lock","inputLocks":[{"burn":true,"hashes":["1"]}]}`, `{"method":"lock","inputLocks":[{"jam":"02","burn":true}]}`, `{}`, `{"method":"formatNocks","nicks":1}`, `{"method":"formatNocks","nicks":"01"}`, `{"method":"formatNocks","nicks":"-1"}`, `{"method":"parseNocks","amount":"1","unknown":true}`, `{"method":"parseNocks","amount":"1"} {}`, strings.Repeat(" ", 4<<20+1)} {
 		var got map[string]any
 		if e := json.Unmarshal([]byte(Call(request)), &got); e != nil {
 			t.Fatal(e)

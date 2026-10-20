@@ -1,6 +1,6 @@
 # nockchain-go
 
-Nockchain V1 wallet and transaction tools in Go. Derive receiving addresses,
+Nockchain wallet planning and transaction tools in Go. Derive receiving addresses,
 review transactions, prepare payments, and sign single-key or multisig spends.
 Use the same package natively or through its WebAssembly adapter.
 
@@ -11,7 +11,7 @@ Published versions and WebAssembly bundles are available in
 [Releases](https://github.com/SWPSCO/nockchain-go/releases).
 
 ```sh
-go get github.com/SWPSCO/nockchain-go@v0.1.1
+go get github.com/SWPSCO/nockchain-go@v0.2.0
 ```
 
 Requires **Go 1.23+**. Import as `nockchain "github.com/SWPSCO/nockchain-go"`.
@@ -25,8 +25,10 @@ Private repository access requires authenticated Git and
 | Wallets and recovery | `GenerateWallet`, `RestoreWallet`, `Master`, `ParseExtendedKey` |
 | Public receiving branches | `ParsePublicKey`, `DeriveReceiveAddress` |
 | Exact native NOCK amounts | `ParseNocks`, `FormatNocks` |
-| Coin selection and change | `SelectTransfer`, `PrepareTransfer` |
-| Multisig and timelocks | `NewPKHLockV1`, `PrepareTransactionV1` |
+| Coin selection and change | `Plan`, `SelectTransfer`, `PrepareTransfer` |
+| Lock policies and proofs | `NewPKHLockV1`, `NewLockTreeV1`, `BuildLockMerkleProof` |
+| Metadata and bridge payloads | `NewNoteData`, `ParseNoteData`, `ComputeBridgeFee` |
+| V0 migration | `ParseNoteV0`, `Plan` with `V0Only` |
 | Transaction inspection | `ParseTransactionV1`, `Summary`, `ID` |
 | Independent signing | `Sign`, `MergeSignatures`, `VerifySignatures` |
 | Input records and height checks | `NoteV1.Hash`, `ValidateInputs` |
@@ -91,7 +93,7 @@ _ = wire
 `SelectTransfer` chooses a sufficient subset using largest amounts first with
 stable note-name ordering. It ignores foreign locks and rejects malformed or
 duplicate records. `PrepareTransfer` consumes all supplied notes. Both support
-plain 1-of-1 PKH inputs, merge repeated recipients, estimate fees, and return
+single-signature PKH inputs, merge repeated recipients, estimate fees, and return
 change to the sender unless `ChangeAddress` is set. `FeeNicks` selects an explicit
 fee. With automatic fees, a remainder too small to cover change metadata becomes
 part of the fee; the review shows the exact amount.
@@ -106,6 +108,71 @@ computes its lock-bound first name component; it does not establish that the not
 exists. Decode metadata with `Cue` from the chain's based-noun encoding. Empty
 metadata is the zero `Noun` only when the stored record is actually empty.
 
+## Pure planning and lock policies
+
+```go
+payment, err := nockchain.PlannedPayment(recipientPKH, 1_000_000, false)
+if err != nil { return err }
+root, err := senderLock.Root()
+if err != nil { return err }
+chain := nockchain.ChainContextAtHeight(chainHeight)
+result, err := nockchain.Plan(nockchain.PlanRequest{
+    Candidates: verifiedNotes, // []nockchain.InputNote
+    Outputs: []nockchain.PlannedOutput{payment},
+    Refund: nockchain.PlannedOutput{LockRoot: root, NoteData: senderLock.Metadata()},
+    Chain: &chain,
+}, nockchain.NewSigningKeyLockMatcher(senderPKH))
+if err != nil { return err }
+// Review Transaction.Summary(), Selected, FinalFee, MinimumFee, Refunds, and WordCounts.
+signed, err := result.Transaction.Sign(sender)
+```
+
+`Selection`, `Order`, `FeeNicks`, and `Sweep` in `PlanRequest` control selection
+and allocation. `LockRootLockMatcher` supplies `Lock`, `LeafNumber`, `Preimages`,
+and an optional `FundPolicy`. `NewLockTreeV1`, `LockMerkleProof`, and
+`BuildLockMerkleProof` expose policies at the transaction boundary.
+
+The pure planner selects eligible notes, reserves a positive seed for every
+input, assigns payments and refunds, and solves the fee from the encoded
+transaction. Selection sorts by amount and then Base58 note name. An explicit
+selection requires every chosen note to be eligible. A sweep consumes all
+eligible candidates into one destination. An exact fee remains visible in the
+review even when it is below the required minimum; signing rejects an underfunded
+transaction.
+
+The signing-key matcher handles single-signature PKH policies and the coinbase
+relative-age policy. The root matcher selects a specific leaf of a disclosed
+lock, checks hashlock preimages, and can use an explicitly configured fund root,
+authoritative first name, and maturity policy. Fund maturity uses the candidate
+height. Fee parameters independently select the fee schedule; the height helper
+sets both together. With no candidate height, timed and fund inputs are ineligible.
+
+Lock trees contain up to 16 leaves and pad to a power of two with burn conditions.
+Leaf numbers start at 1. Conditions support PKH, timelock, hashlock, and burn
+primitives; a burn condition cannot be spent. Proofs preserve the outer tree tag,
+axis, and sibling path. Before Bythos, ordinary inputs use single-leaf stub proofs;
+at Bythos they use full proofs. Refund metadata preserves the entire chosen
+output policy, including trees and custom entries.
+
+## Metadata, bridge payloads, and V0 migration
+
+`NoteData` provides canonical metadata maps, hashing, word counts, and typed
+`LockData`, `BridgeDepositDataPayload`, and `BridgeWithdrawalDataPayload` values.
+Deposit addresses are exactly 20 big-endian bytes. Unknown versions and networks
+remain raw nouns. `ComputeBridgeFee` rounds up to whole NOCK before applying the
+rate and saturates at uint64 limits. Construct an opaque `LockedPaymentV1` with
+`LockRoot` and explicit `NoteData`; full lock forms disclose their metadata by
+default. Ethereum transaction construction and submission belong to the caller.
+
+`ParseNoteV0` reads complete V0 records, including public-key policy, source,
+coinbase flag, and optional timelock. Set `Version: V0Only` in `PlanRequest` to
+migrate those notes into V1 outputs. When parsing a migration transaction,
+supply `TransactionOptions{MigrationNotes: verifiedV0Notes, Fees: &fees}` to
+`ParseTransactionV1`; the wire witness does not contain the V0 input policy.
+Parent validation commits to the complete supplied record. `V1Only` is the
+default candidate policy; V0 and V1 candidates are selected separately.
+`ParseNoteV1` and `NoteV1.Noun` round-trip complete V1 records.
+
 ## Multisig and timelocks
 
 ```go
@@ -117,7 +184,7 @@ lock, err := nockchain.NewPKHLockV1(2, []nockchain.Digest{alicePKH, bobPKH, caro
     })
 if err != nil { return err }
 fee, err := nockchain.MinimumTransactionFeeV1(
-    []nockchain.LockV1{lock}, []nockchain.LockV1{recipientLock})
+    []nockchain.LockFormV1{lock}, []nockchain.LockFormV1{recipientLock})
 if err != nil { return err }
 plan, err := nockchain.PrepareTransactionV1([]nockchain.LockedSpendPlanV1{{
     Note: verifiedNote, Lock: lock, Fee: fee,
@@ -170,22 +237,19 @@ and finality. The library neither fetches chain state nor broadcasts payments.
 
 ## Scope and limits
 
-Transactions use full axis-1 PKH proofs, optionally followed by a conjunctive
-timelock, and ordinary output seeds. Other proof forms, hashlocks, burn locks,
-source-constrained outputs, and bridge construction return unsupported errors.
-Input and output metadata is preserved as immutable based nouns; the builder
-creates full lock metadata for its outputs.
-
-Every input requires a nonzero output seed. Limits are 64 inputs, 256 total
-output seeds, 32 keys per lock, 64 entries per metadata map, 2,048 flattened
-metadata words per output lock, 65,536 logical transaction nodes, and depth 256.
+Transactions support V1 lock proofs and V0-to-V1 migration spends. Outputs have
+unconstrained source fields. Limits are 64 inputs, 256 output seeds, 32 keys per
+lock, 64 entries per metadata map, 2,048 flattened metadata words per output
+lock, 65,536 logical transaction nodes, and depth 256.
 These limits apply together.
 Noun atoms must be below the Goldilocks prime. `Jam`/`Cue` are bounded based-noun
 codecs, not arbitrary-precision Nock atom containers.
 
-Fee sizing follows the canonical Hoon engine's current mainnet V1 schedule:
-flattened metadata entries are merged per output lock, witnesses include exactly
-the required signatures, and conflicting values for one metadata key are rejected. Applications must track network rule changes.
+`FeeParameters` controls the phase height, base rate, witness divisor, and minimum.
+At Bythos, metadata is merged per output lock and the witness discount applies.
+Before Bythos, metadata is counted per seed and the base rate doubles.
+The default fee context is height 54,000; pass `ChainContextAtHeight` or explicit
+parameters for the chain being used. Conflicting metadata is rejected.
 Base ERC-20 NOCK has **16 decimal places**; its units differ from native nicks.
 
 Private-key arithmetic is **variable-time**. Use offline, trusted signing tools,
@@ -210,28 +274,20 @@ complete Rust bytes, IDs, signatures and lock roots. A separate Hoon oracle
 checks the same transactions against the canonical engine for validity, input
 commitments and minimum fees.
 
-The protocol source of truth is the pinned Nockchain Hoon implementation. Rust
-wallet fixtures provide an additional wire-format interoperability check.
-
-Reference sources:
-
-- [zorp-corp/nockchain](https://github.com/zorp-corp/nockchain/tree/1eac02083a053c104b6a1299e80a8a51447017dc),
-  `1eac02083a053c104b6a1299e80a8a51447017dc`: `hoon/common/tx-engine.hoon`,
-  `tx-engine-1.hoon`, `ztd/three.hoon` and `slip10.hoon` define fees, note
-  commitments, spend validation, lock semantics and cryptography.
-
-- [SWPSCO/tx-types](https://github.com/SWPSCO/tx-types/tree/5f9ab2b38f1685a908f19a0e8f18e7845b3e7f35),
-  `5f9ab2b38f1685a908f19a0e8f18e7845b3e7f35`: Cheetah, TIP5, note commitments,
-  canonical noun trees and codecs.
-- [SWPSCO/nockster](https://github.com/SWPSCO/nockster/tree/d62110560dd005827ae8a46126c9841c86db0d6a),
-  `d62110560dd005827ae8a46126c9841c86db0d6a`: wallet addresses, V1 signing,
-  transaction IDs and multisig signing.
-- [Trezor BIP39 vectors](https://github.com/trezor/python-mnemonic/blob/master/vectors.json):
-  24 English entropy, mnemonic and seed fixtures.
+Wallet behavior is checked against the official Hoon source at
+[`9bcc26c`](https://github.com/zorp-corp/nockchain/tree/9bcc26c6c57019dfde7f83aad9a9dd4ed5cd7902)
+and the shared Rust wallet core at
+[`02d1946`](https://github.com/SWPSCO/tx-types/tree/02d194605c475013745cc65b26f1413cd098932e).
+The wallet corpus covers all 31 tagged lock leaves, metadata and bridge payloads,
+phase-dependent fees, seven planner scenarios, and four V0 migration scenarios
+with exact unsigned and signed bytes. Fixture files retain their source pins and
+SHA-256 checksums. The Go repository contains the reproducible generators;
+normal SDK tests use checked-in data and run offline.
 
 ```sh
 python3 testdata/reference-generator/generate.py /path/to/tx-types /path/to/nockster
 python3 testdata/consensus-generator/generate.py /path/to/nockchain
+python3 testdata/wallet-generator/generate.py /path/to/tx-types --check --protocol-corpus testdata/reference.json
 # Optional private wallet-export check; the file stays outside version control:
 NOCKCHAIN_TEST_KEY=/private/path/test.key go test -run TestLocalWalletExport
 ```

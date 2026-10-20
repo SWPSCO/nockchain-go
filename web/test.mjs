@@ -45,8 +45,43 @@ for (const v of fixture.multisig) {
   assert.equal(merged.jam, v.jam);
   assert.equal(api.call('verifySignatures', { jam: merged.jam }), true);
   assert.equal(api.call('validateInputs', { jam: merged.jam, notes: [note], height: '105' }), true);
-  if (v.timed) assert.throws(() => api.call('validateInputs', { jam: merged.jam, notes: [note], height: '104' }), /timelock/);
+  if (v.timed) assert.throws(() => api.call('validateInputs', { jam: merged.jam, notes: [note], height: '104' }), /lock or maturity/);
+}
+const wallet = JSON.parse(await readFile(new URL('../testdata/wallet/reference.json', import.meta.url), 'utf8'));
+function digest(limbs) {
+  let value = limbs.reduceRight((n, limb) => n * 18446744069414584321n + BigInt(limb), 0n), text = '';
+  const alphabet = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
+  do { text = alphabet[Number(value % 58n)] + text; value /= 58n; } while (value);
+  return text;
+}
+const output = o => ({ lockRoot: digest(o.root), noteDataJam: o.data, nicks: o.amount });
+for (const row of [...wallet.plans, ...wallet.migrations]) {
+  const notes = row.candidates.map(jam => ({ jam })), fees = { height: row.height };
+  const planning = {
+    outputs: row.outputs.map(output), refund: output(row.refund), signerPKH: digest(row.signer),
+    version: row.version, ...(row.order ? { order: row.order } : {}),
+    ...(row.exactFee !== undefined && row.exactFee !== null ? { feeNicks: row.exactFee } : {}),
+    ...(row.sweep ? { sweep: output(row.sweep) } : {}),
+  };
+  if (row.selection) planning.selection = api.call('inspect', { jam: row.jam, fees }).spends.map(({ first, last }) => ({ first, last }));
+  const result = api.call('plan', { notes, height: row.height, planning });
+  assert.equal(result.transaction.jam, row.jam, row.case);
+  assert.equal(result.finalFee, row.fee); assert.equal(result.minimumFee, row.minimumFee);
+  assert.equal(result.seedWords, row.seedWords); assert.equal(result.witnessWords, row.witnessWords);
+  if (row.signedJam) {
+    const signer = fixture.keys.find(k => k.seed === row.seed && k.path.length === 0);
+    const signed = api.call('signTransaction', { jam: row.jam, key: signer.zprv, notes, fees });
+    assert.equal(signed.jam, row.signedJam, row.case);
+    assert.equal(signed.summary.spends[0].proofJam, null);
+    assert.equal(api.call('verifySignatures', { jam: signed.jam, notes, fees }), true);
+    assert.equal(api.call('validateInputs', { jam: signed.jam, notes: result.selected.map(({ jam }) => ({ jam })), fees, height: row.height }), true);
+    assert.throws(() => api.call('inspect', { jam: signed.jam, fees }), /migration/);
+  }
+}
+for (const row of wallet.locks) {
+  const review = api.call('lock', { inputLocks: [{ jam: row.form }] });
+  assert.equal(review.root, digest(row.root)); assert.equal(review.lockJam, row.form);
 }
 await assert.rejects(() => loadNockchain(bytes), /already loaded/);
-console.log('WebAssembly: derivation, exact amounts, Rust transactions, multisig, timelocks, signing, merging and errors pass.');
+console.log('WebAssembly: derivation, exact amounts, Rust transactions, multisig, timelocks, signing, merging, planner goldens, V0 migrations and errors pass.');
 process.exit(0);

@@ -9,17 +9,21 @@ import (
 
 // LockedPaymentV1 creates an output with the lock's full metadata.
 type LockedPaymentV1 struct {
-	Lock  LockV1
-	Nicks uint64
+	Lock     LockFormV1
+	Nicks    uint64
+	LockRoot *Digest
+	NoteData *Noun
 }
 
 // LockedSpendPlanV1 assigns the complete value of one verified note to outputs
 // and fee. Every input retains at least one nonzero output seed.
 type LockedSpendPlanV1 struct {
-	Note    NoteV1
-	Lock    LockV1
-	Outputs []LockedPaymentV1
-	Fee     uint64
+	Note       InputNote
+	Lock       InputLock
+	LeafNumber int
+	Preimages  []Noun
+	Outputs    []LockedPaymentV1
+	Fee        uint64
 }
 
 // OutputV1 describes a committed seed. Metadata is immutable and must be checked
@@ -32,35 +36,59 @@ type OutputV1 struct {
 }
 
 // Lock returns the authenticated PKH lock in this output's metadata, if present.
-func (o OutputV1) Lock() (LockV1, error) {
-	var found LockV1
-	_, e := readTree(o.NoteData, true, 64, func(k, v Noun) (Digest, Digest, error) {
-		if k == (Noun{atom: 0x6b636f6c}) {
-			p, e := parts(v, 2)
-			if e != nil || !zero(p[0]) {
-				return Digest{}, Digest{}, errMalformed
-			}
-			l, e := parseCondition(p[1])
-			if e != nil {
-				return Digest{}, Digest{}, e
-			}
-			found = l
-		}
-		return Digest{}, Digest{}, nil
-	})
+func (o OutputV1) Lock() (LockFormV1, error) {
+	entries, e := metadataEntries(o.NoteData)
 	if e != nil {
-		return LockV1{}, e
+		return nil, e
 	}
-	if found.threshold == 0 || found.root != o.LockRoot {
-		return LockV1{}, errors.New("output metadata does not authenticate its lock")
+	value, ok := entries[0x6b636f6c]
+	if !ok {
+		return nil, errors.New("output lock metadata is absent")
 	}
-	return found, nil
+	data, e := ParseLockData(value)
+	if e != nil {
+		return nil, e
+	}
+	root, e := data.Lock.Root()
+	if e != nil || root != o.LockRoot {
+		return nil, errors.New("output metadata does not authenticate its lock")
+	}
+	return data.Lock, nil
+}
+
+// TransactionOptions carries the fee phase and any authoritative fund policy.
+type TransactionOptions struct {
+	MigrationNotes []NoteV0
+	Fees           *FeeParameters
+	FundPolicy     *FundLockPolicy
+}
+
+func transactionOptions(options []TransactionOptions) (FeeParameters, *FundLockPolicy, error) {
+	if len(options) > 1 {
+		return FeeParameters{}, nil, errors.New("multiple transaction options")
+	}
+	fees := DefaultFeeParameters()
+	var fund *FundLockPolicy
+	if len(options) == 1 {
+		if options[0].Fees != nil {
+			fees = *options[0].Fees
+		}
+		if options[0].FundPolicy != nil {
+			value := *options[0].FundPolicy
+			if !value.valid() {
+				return FeeParameters{}, nil, errors.New("invalid fund policy")
+			}
+			fund = &value
+		}
+	}
+	return fees, fund, nil
 }
 
 // SpendSummaryV1 is a detached input review; SignedKeys describes present signatures.
 type SpendSummaryV1 struct {
+	Proof         LockMerkleProof
 	Name          NoteName
-	Lock          LockV1
+	Lock          InputLock
 	Fee           uint64
 	Outputs       []OutputV1
 	SignedKeys    []Digest
@@ -78,12 +106,15 @@ type signedPKH struct {
 	signature Signature
 }
 type transactionSpend struct {
-	name       NoteName
-	lock       LockV1
-	fee        uint64
-	seeds      *nounTree
-	outputs    []OutputV1
-	signatures map[Digest]signedPKH
+	migrationNote *NoteV0
+	proof         LockMerkleProof
+	preimages     []Noun
+	name          NoteName
+	lock          signingLock
+	fee           uint64
+	seeds         *nounTree
+	outputs       []OutputV1
+	signatures    map[Digest]signedPKH
 }
 
 func (s transactionSpend) signatureHash() Digest {
@@ -95,19 +126,37 @@ func (s transactionSpend) signatureTree() *nounTree {
 		p, _ := parsePoint(v.public)
 		pn, sn := publicNoun(p), v.signature.noun()
 		h := hashCell(k, hashCell(mustHashNoun(pn), mustHashNoun(sn)))
-		tree = treePut(tree, newTree(digestNoun(k), Cell(pn, sn), h, h, true))
+		key, value := digestNoun(k), Cell(pn, sn)
+		if s.migrationNote != nil {
+			h = hashCell(k, mustHashNoun(sn))
+			key, value = pn, sn
+		}
+		tree = treePut(tree, newTree(key, value, h, h, true))
 	}
 	return tree
 }
 func (s transactionSpend) witness() Noun {
-	return Tuple(s.lock.proof(), s.signatureTree().noun(), Noun{}, Noun{})
+	if s.migrationNote != nil {
+		return s.signatureTree().noun()
+	}
+	tree, _ := preimageTree(s.preimages)
+	return Tuple(s.proof.noun(), s.signatureTree().noun(), tree.noun(), Noun{})
 }
 func (s transactionSpend) hash() Digest {
-	w := foldHashes(s.lock.proofHash(), s.signatureTree().digest(false), hashAtom(0), hashAtom(0))
+	if s.migrationNote != nil {
+		return foldHashes(hashAtom(0), s.signatureTree().digest(false), s.seeds.digest(false), hashAtom(s.fee))
+	}
+	proof, _ := s.proof.Hash()
+	tree, _ := preimageTree(s.preimages)
+	w := foldHashes(proof, s.signatureTree().digest(false), tree.digest(false), hashAtom(0))
 	return foldHashes(hashAtom(1), w, s.seeds.digest(false), hashAtom(s.fee))
 }
 func (s transactionSpend) noun() Noun {
-	return Tuple(Noun{atom: 1}, s.witness(), s.seeds.noun(), Noun{atom: s.fee})
+	version := uint64(1)
+	if s.migrationNote != nil {
+		version = 0
+	}
+	return Tuple(Noun{atom: version}, s.witness(), s.seeds.noun(), Noun{atom: s.fee})
 }
 func (s transactionSpend) clone() transactionSpend {
 	m := map[Digest]signedPKH{}
@@ -116,15 +165,19 @@ func (s transactionSpend) clone() transactionSpend {
 	}
 	s.signatures = m
 	s.outputs = append([]OutputV1(nil), s.outputs...)
+	s.proof = s.proof.clone()
+	s.preimages = append([]Noun(nil), s.preimages...)
 	return s
 }
 
 // TransactionV1 is an immutable unsigned, partially signed, or signed transaction.
 // Every signature changes its ID. Signing commits each input's seeds and fee.
 type TransactionV1 struct {
-	raw    Noun
-	id     Digest
-	spends []transactionSpend
+	fees       FeeParameters
+	fundPolicy *FundLockPolicy
+	raw        Noun
+	id         Digest
+	spends     []transactionSpend
 }
 
 // ID returns the commitment to the transaction including signatures.
@@ -169,22 +222,35 @@ func leaves(n Noun) uint64 {
 const MaxNoteDataWordsV1 = 2048
 
 func (t TransactionV1) minimumFee() (uint64, error) {
-	var witness uint64
+	var witness, unmerged uint64
 	metadata := map[Digest]map[uint64]Noun{}
 	for _, s := range t.spends {
 		count := len(s.signatures)
-		if count < s.lock.threshold {
-			count = s.lock.threshold
+		if count < s.lock.Threshold() {
+			count = s.lock.Threshold()
 		}
 		// A signature map has 35 leaves per entry plus the empty terminator.
-		witness += leaves(s.lock.proof()) + uint64(count)*35 + 1 + 2
+		preimages, _ := preimageTree(s.preimages)
+		if s.migrationNote != nil {
+			witness += 1 + uint64(count)*30
+		} else {
+			witness += leaves(s.proof.noun()) + uint64(count)*35 + 2 + leaves(preimages.noun())
+		}
 		for _, o := range s.outputs {
+			words, e := NoteDataWords(o.NoteData)
+			if e != nil {
+				return 0, e
+			}
+			if words > MaxNoteDataWordsV1 {
+				return 0, errors.New("output metadata exceeds consensus word limit")
+			}
+			unmerged += words
 			entries, exists := metadata[o.LockRoot]
 			if !exists {
 				entries = map[uint64]Noun{}
 				metadata[o.LockRoot] = entries
 			}
-			_, e := readTree(o.NoteData, true, 64, func(k, v Noun) (Digest, Digest, error) {
+			_, e = readTree(o.NoteData, true, 64, func(k, v Noun) (Digest, Digest, error) {
 				tag, e := atomValue(k)
 				if e != nil {
 					return Digest{}, Digest{}, e
@@ -213,14 +279,20 @@ func (t TransactionV1) minimumFee() (uint64, error) {
 		}
 		data += words
 	}
-	fee := data*(1<<14) + witness*(1<<12)
-	if fee < 256 {
-		fee = 256
+	if t.fees.Height < t.fees.BythosPhase {
+		data = unmerged
 	}
-	return fee, nil
+	return ComputeMinimumFee(WordCountBreakdown{data, witness}, t.fees).MinimumFee, nil
 }
 
-func assembleTransaction(spends []transactionSpend) (TransactionV1, error) {
+func assembleTransaction(spends []transactionSpend, options ...TransactionOptions) (TransactionV1, error) {
+	fees, fund, e := transactionOptions(options)
+	if e != nil {
+		return TransactionV1{}, e
+	}
+	if len(spends) < 1 || len(spends) > MaxTransferInputs {
+		return TransactionV1{}, errors.New("input count out of range")
+	}
 	var tree *nounTree
 	outputs := 0
 	for _, s := range spends {
@@ -233,7 +305,7 @@ func assembleTransaction(spends []transactionSpend) (TransactionV1, error) {
 		tree = treePut(tree, newTree(s.name.noun(), s.noun(), h, h, true))
 	}
 	id := hashCell(hashAtom(1), tree.digest(false))
-	t := TransactionV1{Tuple(Noun{atom: 1}, digestNoun(id), tree.noun()), id, spends}
+	t := TransactionV1{raw: Tuple(Noun{atom: 1}, digestNoun(id), tree.noun()), id: id, spends: spends, fees: fees, fundPolicy: fund}
 	if e := boundedNoun(t.raw); e != nil {
 		return TransactionV1{}, e
 	}
@@ -255,8 +327,8 @@ func (t TransactionV1) Summary() (TransactionSummaryV1, error) {
 		if e != nil {
 			return out, e
 		}
-		v := SpendSummaryV1{Name: s.name, Lock: s.lock, Fee: s.fee, Outputs: append([]OutputV1(nil), s.outputs...), SignatureHash: s.signatureHash()}
-		for _, k := range s.lock.keys {
+		v := SpendSummaryV1{Proof: s.proof.clone(), Name: s.name, Lock: s.lock, Fee: s.fee, Outputs: append([]OutputV1(nil), s.outputs...), SignatureHash: s.signatureHash()}
+		for _, k := range s.lock.Keys() {
 			if _, ok := s.signatures[k]; ok {
 				v.SignedKeys = append(v.SignedKeys, k)
 			}
@@ -275,52 +347,147 @@ func (t TransactionV1) Summary() (TransactionSummaryV1, error) {
 
 // PrepareTransactionV1 validates note commitments, declared balances and fees,
 // and builds an unsigned transaction for independent review and signing.
-func PrepareTransactionV1(plans []LockedSpendPlanV1) (TransactionV1, error) {
+func PrepareTransactionV1(plans []LockedSpendPlanV1, options ...TransactionOptions) (TransactionV1, error) {
+	fees, fund, e := transactionOptions(options)
+	if e != nil {
+		return TransactionV1{}, e
+	}
+	return prepareTransaction(plans, fees, fund, true)
+}
+func checkUnlock(proof LockMerkleProof, preimages []Noun) error {
+	if _, e := proof.Condition.RequiredPKHPolicy(); e != nil {
+		return e
+	}
+	if _, e := preimageTree(preimages); e != nil {
+		return e
+	}
+	supplied := map[Digest]bool{}
+	for _, value := range preimages {
+		supplied[hashEach(value)] = true
+	}
+	if proof.Condition.burn {
+		return errors.New("burned condition")
+	}
+	for _, hash := range proof.Condition.hashes {
+		if !supplied[hash] {
+			return errors.New("missing hashlock preimage")
+		}
+	}
+	return nil
+}
+func prepareTransaction(plans []LockedSpendPlanV1, fees FeeParameters, fundPolicy *FundLockPolicy, checkFee bool) (TransactionV1, error) {
 	if len(plans) < 1 || len(plans) > MaxTransferInputs {
 		return TransactionV1{}, errors.New("input count out of range")
 	}
 	seen := map[NoteName]bool{}
 	spends := make([]transactionSpend, 0, len(plans))
 	for _, p := range plans {
+		var e error
+		p.Note, e = snapshotInput(p.Note)
+		if e != nil {
+			return TransactionV1{}, e
+		}
 		parent, e := p.Note.Hash()
 		if e != nil {
 			return TransactionV1{}, e
 		}
-		bound, _ := NoteFirstV1(p.Lock.root)
-		if p.Lock.threshold == 0 || p.Note.Name.First != bound || seen[p.Note.Name] || p.Fee >= Prime || len(p.Outputs) == 0 {
+		name := p.Note.Identity()
+		var migration *NoteV0
+		var proof LockMerkleProof
+		var lock signingLock
+		authorized := false
+		if p.Note.Version() == 0 {
+			note, ok := p.Note.snapshot().(NoteV0)
+			if !ok {
+				return TransactionV1{}, errors.New("invalid migration input")
+			}
+			migration = &note
+			policy, ok := p.Lock.(LockV0)
+			if !ok {
+				return TransactionV1{}, errors.New("input and lock version differ")
+			}
+			first, e := NoteFirstV0(policy, note.Timelock != nil)
+			if e != nil {
+				return TransactionV1{}, e
+			}
+			authorized = policy.root == note.Lock.root && name.First == first && len(p.Preimages) == 0 && (p.LeafNumber == 0 || p.LeafNumber == 1)
+			lock = policy
+		} else {
+			form, ok := p.Lock.(LockFormV1)
+			if !ok {
+				return TransactionV1{}, errors.New("input and lock version differ")
+			}
+			leaf := p.LeafNumber
+			if leaf == 0 {
+				leaf = 1
+			}
+			proof, e = BuildLockMerkleProof(form, leaf, fees.Height >= fees.BythosPhase)
+			if e != nil {
+				return TransactionV1{}, e
+			}
+			fund := fundPolicy != nil && fundPolicy.Authenticates(proof, name.First)
+			authorized = fund || proof.Check(name.First)
+			if e := checkUnlock(proof, p.Preimages); e != nil {
+				return TransactionV1{}, e
+			}
+			lock = proof.Condition
+		}
+		if !authorized || seen[name] || p.Fee >= Prime || len(p.Outputs) == 0 {
 			return TransactionV1{}, errors.New("invalid, duplicate, or lock-mismatched input")
 		}
-		seen[p.Note.Name] = true
-		s := transactionSpend{name: p.Note.Name, lock: p.Lock, fee: p.Fee, signatures: map[Digest]signedPKH{}}
+		seen[name] = true
+		s := transactionSpend{name: name, lock: lock, migrationNote: migration, proof: proof.clone(), preimages: append([]Noun(nil), p.Preimages...), fee: p.Fee, signatures: map[Digest]signedPKH{}}
 		total := p.Fee
 		roots := map[Digest]bool{}
 		for _, o := range p.Outputs {
-			if o.Lock.threshold == 0 || o.Nicks == 0 || o.Nicks >= Prime || roots[o.Lock.root] {
+			var root Digest
+			metadata := Noun{}
+			if o.Lock != nil {
+				root, e = o.Lock.Root()
+				if e != nil {
+					return TransactionV1{}, e
+				}
+				metadata = o.Lock.Metadata()
+			} else if o.LockRoot != nil {
+				root = *o.LockRoot
+			} else {
+				return TransactionV1{}, errors.New("missing output lock")
+			}
+			if !root.Valid() || o.Nicks == 0 || o.Nicks >= Prime || roots[root] {
 				return TransactionV1{}, errors.New("invalid or duplicate output lock")
 			}
-			roots[o.Lock.root] = true
+			if o.LockRoot != nil && *o.LockRoot != root {
+				return TransactionV1{}, errors.New("output lock root mismatch")
+			}
+			roots[root] = true
 			total, e = addAmount(total, o.Nicks)
 			if e != nil {
 				return TransactionV1{}, e
 			}
-			metadata := o.Lock.metadata()
-			dh, _ := metadataHash(metadata)
-			regular := foldHashes(o.Lock.root, dh, hashAtom(o.Nicks), parent)
-			seed := Tuple(Noun{}, digestNoun(o.Lock.root), metadata, Noun{atom: o.Nicks}, digestNoun(parent))
+			if o.NoteData != nil {
+				metadata = *o.NoteData
+			}
+			dh, e := metadataHash(metadata)
+			if e != nil {
+				return TransactionV1{}, e
+			}
+			regular := foldHashes(root, dh, hashAtom(o.Nicks), parent)
+			seed := Tuple(Noun{}, digestNoun(root), metadata, Noun{atom: o.Nicks}, digestNoun(parent))
 			s.seeds = treePut(s.seeds, newTree(seed, Noun{}, regular, hashCell(hashAtom(0), regular), false))
-			s.outputs = append(s.outputs, OutputV1{o.Lock.root, metadata, o.Nicks, parent})
+			s.outputs = append(s.outputs, OutputV1{root, metadata, o.Nicks, parent})
 		}
-		if total != p.Note.Nicks {
+
+		if total != p.Note.Amount() {
 			return TransactionV1{}, errors.New("input value differs from outputs plus fee")
 		}
 		spends = append(spends, s)
 	}
-	tx, e := assembleTransaction(spends)
+	tx, e := assembleTransaction(spends, TransactionOptions{Fees: &fees, FundPolicy: fundPolicy})
 	if e != nil {
 		return TransactionV1{}, e
 	}
 	summary, _ := tx.Summary()
-	if summary.FeeNicks < summary.MinimumFeeNicks {
+	if checkFee && summary.FeeNicks < summary.MinimumFeeNicks {
 		return TransactionV1{}, fmt.Errorf("fee below minimum %d nicks", summary.MinimumFeeNicks)
 	}
 	return tx, nil
@@ -331,7 +498,7 @@ func (t TransactionV1) verify(requireThreshold bool) error {
 		return errors.New("uninitialized transaction")
 	}
 	for _, s := range t.spends {
-		if len(s.signatures) > s.lock.threshold || (requireThreshold && len(s.signatures) != s.lock.threshold) {
+		if len(s.signatures) > s.lock.Threshold() || (requireThreshold && len(s.signatures) != s.lock.Threshold()) {
 			return errors.New("signature count must equal the threshold")
 		}
 		for k, v := range s.signatures {
@@ -377,7 +544,7 @@ func (t TransactionV1) Sign(key ExtendedKey) (TransactionV1, error) {
 		s = s.clone()
 		if s.lock.authorizes(pkh) {
 			matched = true
-			if _, exists := s.signatures[pkh]; !exists && len(s.signatures) >= s.lock.threshold {
+			if _, exists := s.signatures[pkh]; !exists && len(s.signatures) >= s.lock.Threshold() {
 				return TransactionV1{}, errors.New("input already has its required signatures")
 			}
 			sig, e := key.SignDigest(s.signatureHash())
@@ -391,7 +558,7 @@ func (t TransactionV1) Sign(key ExtendedKey) (TransactionV1, error) {
 	if !matched {
 		return TransactionV1{}, errors.New("key is not authorized by any input")
 	}
-	out, e := assembleTransaction(spends)
+	out, e := assembleTransaction(spends, TransactionOptions{Fees: &t.fees, FundPolicy: t.fundPolicy})
 	if e != nil {
 		return TransactionV1{}, e
 	}
@@ -410,6 +577,9 @@ func (t TransactionV1) MergeSignatures(other TransactionV1) (TransactionV1, erro
 	if e := other.verify(false); e != nil {
 		return TransactionV1{}, e
 	}
+	if t.fees != other.fees || (t.fundPolicy == nil) != (other.fundPolicy == nil) || (t.fundPolicy != nil && *t.fundPolicy != *other.fundPolicy) {
+		return TransactionV1{}, errors.New("different transaction context")
+	}
 	if len(t.spends) != len(other.spends) {
 		return TransactionV1{}, errors.New("different transaction plans")
 	}
@@ -420,7 +590,7 @@ func (t TransactionV1) MergeSignatures(other TransactionV1) (TransactionV1, erro
 	out := make([]transactionSpend, len(t.spends))
 	for i, s := range t.spends {
 		o, ok := byName[s.name]
-		if !ok || s.fee != o.fee || !nounEqual(s.lock.condition, o.lock.condition) || !nounEqual(s.seeds.noun(), o.seeds.noun()) {
+		if !ok || s.fee != o.fee || !nounEqual(s.authorizationNoun(), o.authorizationNoun()) || !nounEqual(s.witnessPreimages(), o.witnessPreimages()) || !nounEqual(s.seeds.noun(), o.seeds.noun()) {
 			return TransactionV1{}, errors.New("different transaction plans")
 		}
 		s = s.clone()
@@ -430,12 +600,12 @@ func (t TransactionV1) MergeSignatures(other TransactionV1) (TransactionV1, erro
 			}
 			s.signatures[k] = v
 		}
-		if len(s.signatures) > s.lock.threshold {
+		if len(s.signatures) > s.lock.Threshold() {
 			return TransactionV1{}, errors.New("merged signatures exceed the threshold")
 		}
 		out[i] = s
 	}
-	tx, e := assembleTransaction(out)
+	tx, e := assembleTransaction(out, TransactionOptions{Fees: &t.fees, FundPolicy: t.fundPolicy})
 	if e != nil {
 		return TransactionV1{}, e
 	}
@@ -448,16 +618,21 @@ func (t TransactionV1) MergeSignatures(other TransactionV1) (TransactionV1, erro
 
 // ValidateInputs checks exact supplied records, parent commitments, balances and
 // timelocks at height. The caller authenticates these records against chain state.
-func (t TransactionV1) ValidateInputs(notes []NoteV1, height uint64) error {
+func (t TransactionV1) ValidateInputs(notes []InputNote, height uint64) error {
 	if len(t.spends) == 0 || len(notes) != len(t.spends) || height >= Prime {
 		return errors.New("input records or height invalid")
 	}
-	m := map[NoteName]NoteV1{}
+	m := map[NoteName]InputNote{}
 	for _, n := range notes {
-		if _, ok := m[n.Name]; ok {
+		var e error
+		n, e = snapshotInput(n)
+		if e != nil {
+			return e
+		}
+		if _, ok := m[n.Identity()]; ok {
 			return errors.New("duplicate input record")
 		}
-		m[n.Name] = n
+		m[n.Identity()] = n
 	}
 	for _, s := range t.spends {
 		n, ok := m[s.name]
@@ -468,8 +643,29 @@ func (t TransactionV1) ValidateInputs(notes []NoteV1, height uint64) error {
 		if e != nil {
 			return e
 		}
-		if n.OriginPage > height || (s.lock.time != nil && !s.lock.time.Allows(height, n.OriginPage)) {
-			return errors.New("input timelock or origin is not satisfied")
+		if s.migrationNote != nil {
+			note, ok := n.snapshot().(NoteV0)
+			if !ok {
+				return errors.New("input version differs from spend")
+			}
+			a, _ := note.Noun()
+			b, _ := s.migrationNote.Noun()
+			if !nounEqual(a, b) || !note.Admits(&height) {
+				return errors.New("migration input lock or timelock is not satisfied")
+			}
+		} else {
+			if n.Version() != 1 {
+				return errors.New("input version differs from spend")
+			}
+			fund := t.fundPolicy != nil && t.fundPolicy.Authenticates(s.proof, n.Identity().First)
+			lock := s.lock.(LockV1)
+			allowed, e := lock.Allows(&height, n.OriginHeight(), s.preimages)
+			if e != nil {
+				return e
+			}
+			if (!fund && (!s.proof.Check(n.Identity().First) || n.OriginHeight() > height)) || (fund && !t.fundPolicy.Maturity.At(height).Admits(n.OriginHeight())) || !allowed {
+				return errors.New("input lock or maturity is not satisfied")
+			}
 		}
 		total := s.fee
 		for _, o := range s.outputs {
@@ -481,7 +677,7 @@ func (t TransactionV1) ValidateInputs(notes []NoteV1, height uint64) error {
 				return e
 			}
 		}
-		if total != n.Nicks {
+		if total != n.Amount() {
 			return errors.New("input value differs from outputs plus fee")
 		}
 	}
@@ -491,22 +687,44 @@ func (t TransactionV1) ValidateInputs(notes []NoteV1, height uint64) error {
 // MinimumTransactionFeeV1 estimates the fee with exactly each input lock's
 // required signatures and merged full lock metadata for the outputs. It uses
 // the pinned V1 fee schedule; no placeholder signatures leave this function.
-func MinimumTransactionFeeV1(inputs, outputs []LockV1) (uint64, error) {
+func MinimumTransactionFeeV1(inputs, outputs []LockFormV1, options ...TransactionOptions) (uint64, error) {
+	fees, _, e := transactionOptions(options)
+	if e != nil {
+		return 0, e
+	}
 	if len(inputs) < 1 || len(inputs) > MaxTransferInputs || len(outputs) == 0 || len(outputs) > MaxTransferOutputs {
 		return 0, errors.New("transaction size out of range")
 	}
-	tx := TransactionV1{spends: make([]transactionSpend, len(inputs))}
+	tx := TransactionV1{spends: make([]transactionSpend, len(inputs)), fees: fees}
 	for i, l := range inputs {
-		if l.threshold == 0 {
-			return 0, errors.New("uninitialized input lock")
+		proof, e := BuildLockMerkleProof(l, 1, fees.Height >= fees.BythosPhase)
+		if e != nil {
+			return 0, e
 		}
-		tx.spends[i].lock = l
+		tx.spends[i].lock = proof.Condition
+		tx.spends[i].proof = proof
 	}
 	for _, l := range outputs {
-		if l.threshold == 0 {
-			return 0, errors.New("uninitialized output lock")
+		if l == nil {
+			return 0, errors.New("missing output lock")
 		}
-		tx.spends[0].outputs = append(tx.spends[0].outputs, OutputV1{LockRoot: l.root, NoteData: l.metadata()})
+		root, e := l.Root()
+		if e != nil {
+			return 0, e
+		}
+		tx.spends[0].outputs = append(tx.spends[0].outputs, OutputV1{LockRoot: root, NoteData: l.Metadata()})
 	}
 	return tx.minimumFee()
+}
+func (s transactionSpend) witnessPreimages() Noun {
+	tree, _ := preimageTree(s.preimages)
+	return tree.noun()
+}
+
+func (s transactionSpend) authorizationNoun() Noun {
+	if s.migrationNote != nil {
+		noun, _ := s.migrationNote.Noun()
+		return noun
+	}
+	return s.proof.noun()
 }

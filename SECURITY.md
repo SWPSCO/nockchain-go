@@ -28,18 +28,19 @@ confirmation policy, and transaction replay protection belong to the integrating
 application. A syntactically valid address or lock root does not establish
 ownership of a payment or its finality.
 
-Transaction construction supports full V1 PKH locks with exactly m-of-n
-signatures and optional conjunctive timelocks. It checks complete note parent
-commitments, declared balances, recipient amounts and fees. Parsing checks
-supported structure and the embedded transaction ID; signature and input-state
-checks are explicit separate methods. The caller authenticates input note
-records, unspent status and finality against trusted chain state.
+Transaction construction supports V1 condition trees and V0 migration inputs.
+PKH policies require exactly m signatures; timelock and hashlock conditions must
+also hold. Fund inputs require an explicit authoritative identity and maturity
+policy. Parsing checks bounded structure and the embedded transaction ID;
+signature and input-state checks are separate explicit methods. The caller
+authenticates complete note records, unspent status, and finality against trusted
+chain state. V0 migration parsing requires the complete input records.
 
-The supported transaction subset excludes other Merkle proof forms, hashlocks,
-burn locks and source-constrained outputs. Metadata is bounded and immutable;
-output metadata only authenticates a recipient policy when its computed lock
-matches the committed root. This package does not provide full consensus
-validation, transaction submission or bridge construction.
+Metadata is bounded and immutable. Output metadata authenticates a policy only
+when its computed lock matches the committed root. Bridge payload codecs and
+fee arithmetic do not establish cross-chain finality or submit Ethereum
+transactions. This package does not provide full consensus validation or
+transaction submission. Applications supply the correct fee and height context.
 
 WebAssembly uses the same cryptographic implementation and retains its timing
 and memory limitations. The JavaScript adapter represents uint64 amounts and

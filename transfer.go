@@ -73,19 +73,28 @@ const MaxTransferOutputs = 256
 // MinimumTransferFeeV1 computes the V1 fee for plain PKH inputs and outputs.
 // Output lock metadata is merged per recipient. The caller supplies every
 // recipient, including change, across all input spends.
-func MinimumTransferFeeV1(inputs int, recipients []Digest) (uint64, error) {
+func MinimumTransferFeeV1(inputs int, recipients []Digest, options ...TransactionOptions) (uint64, error) {
 	if inputs < 1 || inputs > MaxTransferInputs || len(recipients) < 1 || len(recipients) > MaxTransferOutputs {
 		return 0, errors.New("transfer size out of range")
 	}
 	unique := map[Digest]bool{}
-	for _, p := range recipients {
-		if !p.Valid() {
-			return 0, errors.New("invalid recipient")
+	locks := []LockFormV1{}
+	for _, pkh := range recipients {
+		if unique[pkh] {
+			continue
 		}
-		unique[p] = true
+		unique[pkh] = true
+		lock, e := NewPKHLockV1(1, []Digest{pkh}, nil)
+		if e != nil {
+			return 0, e
+		}
+		locks = append(locks, lock)
 	}
-	// Each merged lock metadata map has 13 flattened leaves; a signed full PKH witness has 56.
-	return uint64(len(unique))*13*(1<<14) + uint64(inputs)*56*(1<<12), nil
+	in := make([]LockFormV1, inputs)
+	for i := range in {
+		in[i] = locks[0]
+	}
+	return MinimumTransactionFeeV1(in, locks, options...)
 }
 
 // SignTransferV1 builds and signs up to 64 input spends with this one key. It
@@ -110,7 +119,7 @@ func (k ExtendedKey) SignTransferV1(plans []SpendPlanV1) (TransferV1, error) {
 			if e != nil {
 				return TransferV1{}, e
 			}
-			next.Outputs = append(next.Outputs, LockedPaymentV1{l, o.Nicks})
+			next.Outputs = append(next.Outputs, LockedPaymentV1{Lock: l, Nicks: o.Nicks})
 		}
 		plansWithLocks[i] = next
 	}

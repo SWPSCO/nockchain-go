@@ -8,23 +8,80 @@ import (
 // MaxJamBytes bounds based-noun wire input and output.
 const MaxJamBytes = 16 << 20
 
-// Jam encodes a based noun using Urbit's LSB-first jam format. It emits literals
-// without backreferences, matching pokenoun. Logical expansion is node-bounded.
+// Jam emits canonical structural backreferences with bounded logical expansion.
 func Jam(noun Noun) ([]byte, error) {
-	w := bitWriter{}
-	stack := []Noun{noun}
-	for nodes := 0; len(stack) > 0; nodes++ {
-		if nodes >= MaxNounNodes {
+	type frame struct {
+		n     Noun
+		ready bool
+	}
+	type key struct {
+		atom       uint64
+		head, tail int
+		cell       bool
+	}
+	ids := map[Noun]int{}
+	intern := map[key]int{}
+	sizes := []int{}
+	visit := []frame{{noun, false}}
+	active := map[Noun]bool{}
+	count := 0
+	for len(visit) > 0 {
+		f := visit[len(visit)-1]
+		visit = visit[:len(visit)-1]
+		if _, ok := ids[f.n]; ok {
+			continue
+		}
+		if !f.ready {
+			count++
+			if active[f.n] || count > MaxNounNodes {
+				return nil, errors.New("cyclic noun or logical node limit exceeded")
+			}
+		}
+		if f.n.cell != nil && !f.ready {
+			active[f.n] = true
+			visit = append(visit, frame{f.n, true}, frame{f.n.cell.tail, false}, frame{f.n.cell.head, false})
+			continue
+		}
+		delete(active, f.n)
+		k := key{atom: f.n.atom}
+		size := 1
+		if f.n.cell != nil {
+			k = key{head: ids[f.n.cell.head], tail: ids[f.n.cell.tail], cell: true}
+			size += sizes[k.head] + sizes[k.tail]
+		}
+		if size > MaxNounNodes {
 			return nil, errors.New("noun exceeds logical node limit")
 		}
+		id, ok := intern[k]
+		if !ok {
+			id = len(sizes)
+			intern[k] = id
+			sizes = append(sizes, size)
+		}
+		ids[f.n] = id
+	}
+	w := bitWriter{}
+	refs := map[int]int{}
+	stack := []Noun{noun}
+	for len(stack) > 0 {
 		n := stack[len(stack)-1]
 		stack = stack[:len(stack)-1]
-		if n.cell == nil {
-			w.write(0, 1)
-			w.mat(n.atom)
+		id := ids[n]
+		prior, seen := refs[id]
+		if seen && (n.cell != nil || bits.Len64(n.atom) > bits.Len(uint(prior))) {
+			w.write(3, 2)
+			w.mat(uint64(prior))
 		} else {
-			w.write(1, 2)
-			stack = append(stack, n.cell.tail, n.cell.head)
+			if !seen {
+				refs[id] = w.bit
+			}
+			if n.cell == nil {
+				w.write(0, 1)
+				w.mat(n.atom)
+			} else {
+				w.write(1, 2)
+				stack = append(stack, n.cell.tail, n.cell.head)
+			}
 		}
 		if len(w.bytes) > MaxJamBytes {
 			return nil, errors.New("jam exceeds byte limit")

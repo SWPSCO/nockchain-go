@@ -72,7 +72,7 @@ func TestReferenceTransactionInspection(t *testing.T) {
 		if e = tx.VerifySignatures(); e != nil {
 			t.Fatal(e)
 		}
-		notes := []NoteV1{}
+		notes := []InputNote{}
 		for _, p := range v.Plans {
 			notes = append(notes, p.Note)
 		}
@@ -103,7 +103,7 @@ func TestReferenceMultisigTimelocks(t *testing.T) {
 			if e != nil || parent != v.Parent {
 				t.Fatal("Rust note parent differs", e)
 			}
-			tx, e := PrepareTransactionV1([]LockedSpendPlanV1{{Note: v.Note, Lock: l, Fee: v.Fee, Outputs: []LockedPaymentV1{{l, v.Gift}}}})
+			tx, e := PrepareTransactionV1([]LockedSpendPlanV1{{Note: v.Note, Lock: l, Fee: v.Fee, Outputs: []LockedPaymentV1{{Lock: l, Nicks: v.Gift}}}})
 			if e != nil {
 				t.Fatal(e)
 			}
@@ -149,29 +149,29 @@ func TestReferenceMultisigTimelocks(t *testing.T) {
 			if e = parsed.VerifySignatures(); e != nil {
 				t.Fatal(e)
 			}
-			if e = parsed.ValidateInputs([]NoteV1{v.Note}, 105); e != nil {
+			if e = parsed.ValidateInputs([]InputNote{v.Note}, 105); e != nil {
 				t.Fatal(e)
 			}
 			if v.Timed {
 				for _, h := range []uint64{99, 100, 104, 151, 201} {
-					if e = parsed.ValidateInputs([]NoteV1{v.Note}, h); e == nil {
+					if e = parsed.ValidateInputs([]InputNote{v.Note}, h); e == nil {
 						t.Fatalf("height %d accepted", h)
 					}
 				}
 				for _, h := range []uint64{105, 150} {
-					if e = parsed.ValidateInputs([]NoteV1{v.Note}, h); e != nil {
+					if e = parsed.ValidateInputs([]InputNote{v.Note}, h); e != nil {
 						t.Fatal(e)
 					}
 				}
 			}
 			tampered := v.Note
 			tampered.OriginPage++
-			if e = parsed.ValidateInputs([]NoteV1{tampered}, 110); e == nil {
+			if e = parsed.ValidateInputs([]InputNote{tampered}, 110); e == nil {
 				t.Fatal("wrong parent accepted")
 			}
 			tampered = v.Note
 			tampered.Nicks++
-			if e = parsed.ValidateInputs([]NoteV1{tampered}, 110); e == nil {
+			if e = parsed.ValidateInputs([]InputNote{tampered}, 110); e == nil {
 				t.Fatal("wrong balance accepted")
 			}
 			if _, e = signed.Sign(testKey(t, v.Seeds[2])); e == nil {
@@ -334,7 +334,7 @@ func TestSelectionAndRemainderFees(t *testing.T) {
 	if e != nil {
 		t.Fatal(e)
 	}
-	if len(plan.plans[0].Outputs) == 0 {
+	if len(plan.transaction.spends[0].outputs) == 0 {
 		t.Fatal("input has no output seed")
 	}
 	if _, e = plan.Sign(key); e != nil {
@@ -395,10 +395,10 @@ func TestCompleteNoteMetadataAndLockAuthentication(t *testing.T) {
 	if e != nil {
 		t.Fatal(e)
 	}
-	if e = tx.ValidateInputs([]NoteV1{note}, 100); e != nil {
+	if e = tx.ValidateInputs([]InputNote{note}, 100); e != nil {
 		t.Fatal(e)
 	}
-	if e = tx.ValidateInputs([]NoteV1{v.Note}, 100); e == nil {
+	if e = tx.ValidateInputs([]InputNote{v.Note}, 100); e == nil {
 		t.Fatal("missing input metadata accepted")
 	}
 	wire, _ := tx.Jam()
@@ -406,7 +406,7 @@ func TestCompleteNoteMetadataAndLockAuthentication(t *testing.T) {
 	if e != nil {
 		t.Fatal(e)
 	}
-	if e = parsed.ValidateInputs([]NoteV1{note}, 100); e != nil {
+	if e = parsed.ValidateInputs([]InputNote{note}, 100); e != nil {
 		t.Fatal(e)
 	}
 	sum, _ := parsed.Summary()
@@ -484,7 +484,8 @@ func TestConsensusMetadataFeeAndLimit(t *testing.T) {
 	metadata := Tuple(Cell(Noun{atom: 1}, Noun{atom: 2}), Noun{}, Noun{})
 	v := multisigVectors(t)[0]
 	lock := vectorLock(t, v)
-	tx := TransactionV1{spends: []transactionSpend{{lock: lock, outputs: []OutputV1{{LockRoot: v.Root, NoteData: metadata}}}}}
+	proof, _ := BuildLockMerkleProof(lock, 1, true)
+	tx := TransactionV1{fees: DefaultFeeParameters(), spends: []transactionSpend{{lock: lock, proof: proof, outputs: []OutputV1{{LockRoot: v.Root, NoteData: metadata}}}}}
 	got, e := tx.minimumFee()
 	witnessWords := leaves(lock.proof()) + 2*35 + 3
 	want := uint64(3)*(1<<14) + witnessWords*(1<<12)

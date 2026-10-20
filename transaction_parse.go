@@ -144,59 +144,7 @@ func parseRange(n Noun) (HeightRange, error) {
 	}
 	return r, nil
 }
-func parseCondition(n Noun) (LockV1, error) {
-	if n.cell == nil {
-		return LockV1{}, errMalformed
-	}
-	p, e := parts(n.cell.head, 3)
-	if e != nil || p[0] != (Noun{atom: 0x686b70}) {
-		return LockV1{}, errMalformed
-	}
-	m, e := atomValue(p[1])
-	if e != nil || m > 32 {
-		return LockV1{}, errMalformed
-	}
-	var keys []Digest
-	_, e = readTree(p[2], false, 32, func(k, v Noun) (Digest, Digest, error) { d, e := nounDigest(k); keys = append(keys, d); return d, d, e })
-	if e != nil {
-		return LockV1{}, e
-	}
-	tail := n.cell.tail
-	var tm *TimelockV1
-	if !zero(tail) {
-		if tail.cell == nil || !zero(tail.cell.tail) {
-			return LockV1{}, errMalformed
-		}
-		p, e := parts(tail.cell.head, 3)
-		if e != nil || p[0] != (Noun{atom: 0x6d6974}) {
-			return LockV1{}, errMalformed
-		}
-		r, e := parseRange(p[1])
-		if e != nil {
-			return LockV1{}, e
-		}
-		a, e := parseRange(p[2])
-		if e != nil {
-			return LockV1{}, e
-		}
-		tm = &TimelockV1{r, a}
-	}
-	return NewPKHLockV1(int(m), keys, tm)
-}
-func parseProof(n Noun) (LockV1, error) {
-	p, e := parts(n, 4)
-	if e != nil || p[0] != (Noun{atom: 0x6c6c7566}) || p[2] != (Noun{atom: 1}) {
-		return LockV1{}, errMalformed
-	}
-	l, e := parseCondition(p[1])
-	if e != nil {
-		return LockV1{}, e
-	}
-	if !nounEqual(l.proof(), n) {
-		return LockV1{}, errors.New("lock proof does not match its root")
-	}
-	return l, nil
-}
+func parseCondition(n Noun) (LockV1, error) { return ParseSpendCondition(n) }
 func parsePublic(n Noun) ([]byte, error) {
 	p, e := parts(n, 3)
 	if e != nil || p[2] != (Noun{atom: 1}) {
@@ -256,7 +204,11 @@ func parseSignature(n Noun) (Signature, error) {
 // optional conjunctive timelocks, and ordinary output seeds. It rejects other
 // lock/proof forms, source-constrained outputs, malformed trees and mismatched IDs.
 // Call VerifySignatures and ValidateInputs explicitly before considering a spend.
-func ParseTransactionV1(jam []byte) (TransactionV1, error) {
+func ParseTransactionV1(jam []byte, options ...TransactionOptions) (TransactionV1, error) {
+	fees, fundPolicy, e := transactionOptions(options)
+	if e != nil {
+		return TransactionV1{}, e
+	}
 	n, e := Cue(jam)
 	if e != nil {
 		return TransactionV1{}, e
@@ -271,6 +223,18 @@ func ParseTransactionV1(jam []byte) (TransactionV1, error) {
 	embedded, e := nounDigest(p[1])
 	if e != nil {
 		return TransactionV1{}, e
+	}
+	migrationByName := map[NoteName]NoteV0{}
+	if len(options) > 0 {
+		for _, note := range options[0].MigrationNotes {
+			if _, ok := migrationByName[note.Name]; ok {
+				return TransactionV1{}, errors.New("duplicate migration input")
+			}
+			if _, e := note.Hash(); e != nil {
+				return TransactionV1{}, e
+			}
+			migrationByName[note.Name] = note.snapshot().(NoteV0)
+		}
 	}
 	var spends []transactionSpend
 	_, e = readTree(p[2], true, MaxTransferInputs, func(k, v Noun) (Digest, Digest, error) {
@@ -288,34 +252,73 @@ func ParseTransactionV1(jam []byte) (TransactionV1, error) {
 		}
 		name := NoteName{first, last}
 		sp, e := parts(v, 4)
-		if e != nil || sp[0] != (Noun{atom: 1}) {
+		if e != nil || (sp[0] != (Noun{atom: 1}) && sp[0] != (Noun{})) {
 			return Digest{}, Digest{}, errMalformed
 		}
-		w, e := parts(sp[1], 4)
-		if e != nil || !zero(w[2]) || !zero(w[3]) {
-			return Digest{}, Digest{}, errMalformed
-		}
-		lock, e := parseProof(w[0])
-		if e != nil {
-			return Digest{}, Digest{}, e
-		}
-		bound, _ := NoteFirstV1(lock.root)
-		if name.First != bound {
-			return Digest{}, Digest{}, errors.New("note name does not bind input lock")
+		var proof LockMerkleProof
+		var lock signingLock
+		var preimages []Noun
+		var migration *NoteV0
+		var signatureMap Noun
+		if zero(sp[0]) {
+			note, ok := migrationByName[name]
+			if !ok {
+				return Digest{}, Digest{}, errors.New("complete migration input required for inspection")
+			}
+			first, e := NoteFirstV0(note.Lock, note.Timelock != nil)
+			if e != nil || first != name.First {
+				return Digest{}, Digest{}, errors.New("migration input name does not bind its lock")
+			}
+			migration = &note
+			lock = note.Lock
+			signatureMap = sp[1]
+		} else {
+			w, e := parts(sp[1], 4)
+			if e != nil || !zero(w[3]) {
+				return Digest{}, Digest{}, errMalformed
+			}
+			proof, e = ParseLockMerkleProof(w[0])
+			if e != nil {
+				return Digest{}, Digest{}, e
+			}
+			lock = proof.Condition
+			signatureMap = w[1]
+			fund := fundPolicy != nil && fundPolicy.Authenticates(proof, name.First)
+			if !fund && !proof.Check(name.First) {
+				return Digest{}, Digest{}, errors.New("lock proof does not authorize input")
+			}
+			if proof.Full && fees.Height < fees.BythosPhase {
+				return Digest{}, Digest{}, errors.New("full proof precedes activation")
+			}
+			preimages, e = parsePreimages(w[2])
+			if e != nil {
+				return Digest{}, Digest{}, e
+			}
+			if e := checkUnlock(proof, preimages); e != nil {
+				return Digest{}, Digest{}, e
+			}
 		}
 		fee, e := atomValue(sp[3])
 		if e != nil {
 			return Digest{}, Digest{}, e
 		}
-		s := transactionSpend{name: name, lock: lock, fee: fee, signatures: map[Digest]signedPKH{}}
-		_, e = readTree(w[1], true, 32, func(k, v Noun) (Digest, Digest, error) {
-			d, e := nounDigest(k)
-			if e != nil {
-				return Digest{}, Digest{}, e
-			}
-			pv, e := parts(v, 2)
-			if e != nil {
-				return Digest{}, Digest{}, e
+		s := transactionSpend{name: name, lock: lock, proof: proof, migrationNote: migration, preimages: preimages, fee: fee, signatures: map[Digest]signedPKH{}}
+		_, e = readTree(signatureMap, true, 32, func(k, v Noun) (Digest, Digest, error) {
+			var d Digest
+			var pv []Noun
+			var e error
+			if migration != nil {
+				d = mustHashNoun(k)
+				pv = []Noun{k, v}
+			} else {
+				d, e = nounDigest(k)
+				if e != nil {
+					return Digest{}, Digest{}, e
+				}
+				pv, e = parts(v, 2)
+				if e != nil {
+					return Digest{}, Digest{}, e
+				}
 			}
 			pub, e := parsePublic(pv[0])
 			if e != nil {
@@ -330,6 +333,9 @@ func ParseTransactionV1(jam []byte) (TransactionV1, error) {
 			}
 			s.signatures[d] = signedPKH{pub, sig}
 			h := hashCell(d, hashCell(mustHashNoun(pv[0]), mustHashNoun(pv[1])))
+			if migration != nil {
+				h = hashCell(d, mustHashNoun(pv[1]))
+			}
 			return h, h, nil
 		})
 		if e != nil {
@@ -378,7 +384,7 @@ func ParseTransactionV1(jam []byte) (TransactionV1, error) {
 	if len(spends) == 0 {
 		return TransactionV1{}, errors.New("empty transaction")
 	}
-	tx, e := assembleTransaction(spends)
+	tx, e := assembleTransaction(spends, TransactionOptions{Fees: &fees, FundPolicy: fundPolicy})
 	if e != nil {
 		return TransactionV1{}, e
 	}
